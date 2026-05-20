@@ -1,0 +1,13 @@
+{
+  "domain": "tesla_ble",
+  "name": "Tesla BLE",
+  "codeowners": ["@Daniel-dev22"],
+  "config_flow": true,
+  "dependencies": ["bluetooth"],
+  "documentation": "https://github.com/Daniel-dev22/tesla_ble",
+  "integration_type": "device",
+  "iot_class": "local_polling",
+  "issue_tracker": "https://github.com/Daniel-dev22/tesla_ble/issues",
+  "requirements": ["protobuf>=4.21.0", "cryptography>=3.4.0"],
+  "version": "1.0.0"
+}

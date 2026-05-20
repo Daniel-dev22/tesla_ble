@@ -1,0 +1,299 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "Tesla BLE Setup",
+        "description": "Enter your Tesla vehicle VIN to set up BLE control.",
+        "data": {
+          "vin": "Vehicle VIN",
+          "name": "Device Name (Optional)"
+        }
+      },
+      "device_selection": {
+        "title": "Select Tesla Device",
+        "description": "Multiple Tesla devices found. Select the one for VIN: {vin}",
+        "data": {
+          "device": "Tesla Device"
+        }
+      },
+      "device_discovery": {
+        "title": "Tesla BLE Device Discovery",
+        "description": "We'll now scan for your Tesla vehicle with VIN: {vin}. Make sure your vehicle is awake and within Bluetooth range (about 30 feet)."
+      },
+      "select_device": {
+        "title": "Select Tesla Device",
+        "description": "Multiple Tesla devices found. Select the one for VIN: {vin}",
+        "data": {
+          "device": "Tesla Device"
+        }
+      },
+      "pairing_instructions": {
+        "title": "Tesla BLE Pairing Instructions",
+        "description": "To pair with your Tesla (VIN: {vin}, Address: {address}):\n\n1. Sit in your vehicle with the key card/phone key\n2. Put the vehicle in Park\n3. Tap Controls > Locks > Add Key on the vehicle touchscreen\n4. Select 'Key Fob' when prompted\n5. Click 'Continue' below when ready to start pairing"
+      },
+      "pair_device": {
+        "title": "Pairing with Tesla",
+        "description": "Attempting to pair with your Tesla (VIN: {vin}, Address: {address}).\n\nIf pairing fails:\n- Ensure you're in the vehicle with a valid key\n- Make sure you selected 'Key Fob' on the touchscreen\n- Try moving closer to the vehicle\n- Restart the pairing process"
+      },
+      "polling": {
+        "title": "Polling Settings",
+        "description": "Configure how often Home Assistant polls the vehicle after pairing. Values mirror the ESPHome defaults.",
+        "data": {
+          "update_interval": "Update Interval (s)",
+          "post_wake_poll_time": "Fast Poll Duration After Wake (s)",
+          "poll_data_period": "Awake Poll Period (s)",
+          "poll_asleep_period": "Asleep Poll Period (s)",
+          "poll_charging_period": "Charging Poll Period (s)",
+          "ble_disconnected_min_time": "Offline Grace Period (s)",
+          "fast_poll_if_unlocked": "Fast Poll When Unlocked (0 or 1)",
+          "wake_on_boot": "Wake Vehicle On Startup (0 or 1)"
+        }
+      },
+      "reconfigure": {
+        "title": "Adjust Polling Settings",
+        "description": "Update the Tesla BLE polling cadence for {title}.",
+        "data": {
+          "update_interval": "Update Interval (s)",
+          "post_wake_poll_time": "Fast Poll Duration After Wake (s)",
+          "poll_data_period": "Awake Poll Period (s)",
+          "poll_asleep_period": "Asleep Poll Period (s)",
+          "poll_charging_period": "Charging Poll Period (s)",
+          "ble_disconnected_min_time": "Offline Grace Period (s)",
+          "fast_poll_if_unlocked": "Fast Poll When Unlocked (0 or 1)",
+          "wake_on_boot": "Wake Vehicle On Startup (0 or 1)"
+        }
+      }
+    },
+    "error": {
+      "invalid_vin": "Invalid VIN format. Must be 17 alphanumeric characters.",
+      "no_devices_found": "No Tesla BLE devices found nearby.",
+      "cannot_connect": "Cannot connect to the Tesla vehicle.",
+      "pairing_failed": "Failed to pair with Tesla. Please ensure you're in the vehicle and have selected 'Key Fob' on the touchscreen.",
+      "pairing_tap_timeout": "Pairing timed out waiting for the in-vehicle confirmation. Tap your key card or phone on the reader when prompted and try again.",
+      "pairing_ui_denied": "Pairing was denied on the vehicle's touchscreen. Accept the pairing request in the car and try again.",
+      "pairing_cancelled": "Pairing was cancelled from the vehicle. Restart the pairing flow and follow the prompts inside the car.",
+      "pairing_no_permission": "The vehicle reported that this key doesn't have permission to be added. Verify you are using an authorized key and try again.",
+      "pairing_valet_mode": "Pairing failed because the vehicle is in Valet Mode. Disable Valet Mode and retry.",
+      "pairing_already_on_whitelist": "This key is already on the vehicle's whitelist. Remove it first or use a different key."
+    },
+    "abort": {
+      "already_configured": "Device is already configured"
+    }
+  },
+  "options": {
+    "step": {
+      "init": {
+        "title": "Tesla BLE Options",
+        "data": {
+          "update_interval": "Update Interval (s)",
+          "post_wake_poll_time": "Fast Poll Duration After Wake (s)",
+          "poll_data_period": "Awake Poll Period (s)",
+          "poll_asleep_period": "Asleep Poll Period (s)",
+          "poll_charging_period": "Charging Poll Period (s)",
+          "ble_disconnected_min_time": "Offline Grace Period (s)",
+          "fast_poll_if_unlocked": "Fast Poll When Unlocked (0 or 1)",
+          "wake_on_boot": "Wake Vehicle On Startup (0 or 1)"
+        }
+      }
+    }
+  },
+  "entity": {
+    "sensor": {
+      "charge_level": {
+        "name": "Charge Level"
+      },
+      "charge_limit": {
+        "name": "Charge Limit"
+      },
+      "battery_range": {
+        "name": "Range"
+      },
+      "charging_state": {
+        "name": "Charging State"
+      },
+      "charge_current": {
+        "name": "Charge Current"
+      },
+      "charge_voltage": {
+        "name": "Charge Voltage"
+      },
+      "charge_power": {
+        "name": "Charge Power"
+      },
+      "charge_energy_added": {
+        "name": "Charge Energy Added"
+      },
+      "charge_miles_added": {
+        "name": "Charge Miles Added"
+      },
+      "minutes_to_limit": {
+        "name": "Minutes to Limit"
+      },
+      "charge_current_request": {
+        "name": "Requested Charge Current"
+      },
+      "internal_temp": {
+        "name": "Interior Temperature"
+      },
+      "external_temp": {
+        "name": "Exterior Temperature"
+      },
+      "odometer": {
+        "name": "Odometer"
+      },
+      "vehicle_power": {
+        "name": "Vehicle Power"
+      },
+      "ble_rssi": {
+        "name": "BLE Signal"
+      },
+      "shift_state": {
+        "name": "Shift State"
+      },
+      "gps_as_of": {
+        "name": "GPS Timestamp"
+      },
+      "defrost_mode": {
+        "name": "Defrost Mode"
+      },
+      "sentry_mode_state": {
+        "name": "Sentry Mode State"
+      },
+      "tire_pressure_front_left": {
+        "name": "Tire Pressure Front Left"
+      },
+      "tire_pressure_front_right": {
+        "name": "Tire Pressure Front Right"
+      },
+      "tire_pressure_rear_left": {
+        "name": "Tire Pressure Rear Left"
+      },
+      "tire_pressure_rear_right": {
+        "name": "Tire Pressure Rear Right"
+      },
+      "tire_pressure_recommended_front": {
+        "name": "Tire Pressure Recommended Front"
+      },
+      "tire_pressure_recommended_rear": {
+        "name": "Tire Pressure Recommended Rear"
+      }
+    },
+    "binary_sensor": {
+      "is_asleep": {
+        "name": "Asleep"
+      },
+      "is_user_present": {
+        "name": "User Present"
+      },
+      "doors_locked": {
+        "name": "Doors Locked"
+      },
+      "is_charge_flap_open": {
+        "name": "Charge Port Open"
+      },
+      "driver_front_door_open": {
+        "name": "Driver Front Door Open"
+      },
+      "driver_rear_door_open": {
+        "name": "Driver Rear Door Open"
+      },
+      "passenger_front_door_open": {
+        "name": "Passenger Front Door Open"
+      },
+      "passenger_rear_door_open": {
+        "name": "Passenger Rear Door Open"
+      },
+      "is_climate_on": {
+        "name": "Climate On"
+      },
+      "defrost_active": {
+        "name": "Defrost"
+      },
+      "is_frunk_open": {
+        "name": "Frunk Open"
+      },
+      "is_trunk_open": {
+        "name": "Trunk Open"
+      },
+      "windows_open": {
+        "name": "Windows Open"
+      },
+      "sentry_mode": {
+        "name": "Sentry Mode"
+      },
+      "is_preconditioning": {
+        "name": "Preconditioning"
+      },
+      "steering_wheel_heater": {
+        "name": "Steering Wheel Heater"
+      }
+    },
+    "switch": {
+      "charging": {
+        "name": "Charging"
+      },
+      "climate": {
+        "name": "Climate"
+      },
+      "defrost": {
+        "name": "Defrost"
+      },
+      "steering_wheel_heater": {
+        "name": "Steering Wheel Heater"
+      },
+      "sentry_mode": {
+        "name": "Sentry Mode"
+      }
+    },
+    "button": {
+      "pair_key": {
+        "name": "Pair BLE Key"
+      },
+      "honk_horn": {
+        "name": "Honk Horn"
+      },
+      "flash_lights": {
+        "name": "Flash Lights"
+      },
+      "wake_vehicle": {
+        "name": "Wake Vehicle"
+      },
+      "open_frunk": {
+        "name": "Open Frunk"
+      },
+      "unlock_charge_port": {
+        "name": "Unlock Charge Port"
+      },
+      "unlatch_driver_door": {
+        "name": "Unlatch Driver Door"
+      }
+    },
+    "number": {
+      "charge_limit": {
+        "name": "Charge Limit"
+      },
+      "charging_amps": {
+        "name": "Charging Amps"
+      }
+    },
+    "cover": {
+      "frunk": {
+        "name": "Frunk"
+      },
+      "trunk": {
+        "name": "Trunk"
+      },
+      "charge_port": {
+        "name": "Charge Port"
+      },
+      "windows": {
+        "name": "Windows"
+      }
+    },
+    "lock": {
+      "doors": {
+        "name": "Doors"
+      }
+    }
+  }
+}

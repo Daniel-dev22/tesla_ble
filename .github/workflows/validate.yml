@@ -1,0 +1,25 @@
+name: Validate
+
+on:
+  push:
+  pull_request:
+  schedule:
+    - cron: "0 0 * * *"
+
+jobs:
+  # HACS validation. This validates manifest.json required fields, hacs.json
+  # (including content_in_root) and the overall repository layout.
+  #
+  # Note: the home-assistant hassfest action is intentionally NOT run here. It
+  # assumes the standard custom_components/<domain>/ layout and currently fails
+  # on content_in_root repositories (home-assistant/core#152942). If this repo is
+  # ever restructured into custom_components/tesla_ble/, add a hassfest job back.
+  hacs:
+    name: HACS
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hacs/action@main
+        with:
+          category: integration
+          ignore: brands

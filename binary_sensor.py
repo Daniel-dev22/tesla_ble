@@ -12,6 +12,7 @@ from homeassistant.components.binary_sensor import (
     BinarySensorEntityDescription,
 )
 from homeassistant.config_entries import ConfigEntry
+from homeassistant.const import EntityCategory
 from homeassistant.core import HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 
@@ -31,6 +32,15 @@ BINARY_SENSORS: tuple[TeslaBinaryEntityDescription, ...] = (
         key="is_asleep",
         translation_key="is_asleep",
         value_fn=lambda data: data.get("is_asleep"),
+    ),
+    TeslaBinaryEntityDescription(
+        key="ble_unreachable",
+        translation_key="ble_unreachable",
+        device_class=BinarySensorDeviceClass.PROBLEM,
+        entity_category=EntityCategory.DIAGNOSTIC,
+        # on = BLE connections are failing (out of slots / connect timeout). Distinct from
+        # asleep: tells you the car is unreachable, not that it's actually sleeping.
+        value_fn=lambda data: data.get("ble_unreachable"),
     ),
     TeslaBinaryEntityDescription(
         key="is_user_present",

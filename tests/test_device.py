@@ -956,3 +956,135 @@ async def test_waiting_for_auth_exponential_backoff(tesla_device):
     tesla_device._send_session_info_request.assert_awaited_with(
         UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY
     )
+
+
+# ---------------------------------------------------------------------------
+# Proxy rotation: deliberate flips, exponential backoff, graceful release
+# ---------------------------------------------------------------------------
+
+
+def _scanner_device(source, rssi, *, connectable=True):
+    """Build a fake HA scanner-device entry for _select_alternate_proxy_device."""
+    return SimpleNamespace(
+        scanner=SimpleNamespace(source=source, connectable=connectable),
+        advertisement=SimpleNamespace(rssi=rssi),
+        ble_device=SimpleNamespace(address="AA:BB:CC:DD:EE:FF"),
+    )
+
+
+def test_proxy_cooldown_backoff_is_exponential_and_capped(tesla_device):
+    """Each consecutive failure benches a proxy longer, up to the cap."""
+    tesla_device._proxy_fail_streaks = {"p": 1}
+    assert tesla_device._proxy_cooldown_duration("p") == 90.0
+    tesla_device._proxy_fail_streaks = {"p": 2}
+    assert tesla_device._proxy_cooldown_duration("p") == 180.0
+    tesla_device._proxy_fail_streaks = {"p": 3}
+    assert tesla_device._proxy_cooldown_duration("p") == 360.0
+    tesla_device._proxy_fail_streaks = {"p": 99}
+    assert tesla_device._proxy_cooldown_duration("p") == 600.0  # capped at PROXY_COOLDOWN_MAX
+
+
+def test_proxy_rotation_benches_failing_proxy_then_flips(monkeypatch, tesla_device):
+    """The failing current proxy is benched (monotonic backoff) and we flip to the other."""
+    tesla_device.address = "AA:BB:CC:DD:EE:FF"
+    tesla_device._current_proxy_source = "proxyA"
+    sds = [_scanner_device("proxyA", -50), _scanner_device("proxyB", -70)]
+    monkeypatch.setattr(
+        "tesla_ble.device.bluetooth.async_scanner_devices_by_address",
+        lambda *a, **k: sds,
+        raising=False,
+    )
+    monkeypatch.setattr("tesla_ble.device.time.monotonic", lambda: 1000.0)
+
+    chosen = tesla_device._select_alternate_proxy_device()
+
+    # Flipped to B even though A had the stronger RSSI, because A is now benched.
+    assert tesla_device._current_proxy_source == "proxyB"
+    assert chosen is sds[1].ble_device
+    assert tesla_device._proxy_fail_streaks["proxyA"] == 1
+    assert tesla_device._proxy_cooldowns["proxyA"] == 1000.0 + 90.0
+
+
+def test_proxy_rotation_single_proxy_does_not_flip(monkeypatch, tesla_device):
+    """With only one proxy reaching the car there is nothing to flip to."""
+    tesla_device.address = "AA:BB:CC:DD:EE:FF"
+    monkeypatch.setattr(
+        "tesla_ble.device.bluetooth.async_scanner_devices_by_address",
+        lambda *a, **k: [_scanner_device("proxyA", -50)],
+        raising=False,
+    )
+    assert tesla_device._select_alternate_proxy_device() is None
+
+
+def test_proxy_rotation_releases_only_soonest_when_all_cooling(monkeypatch, tesla_device):
+    """When every proxy is benched we release ONLY the soonest-expiring one, not all."""
+    tesla_device.address = "AA:BB:CC:DD:EE:FF"
+    tesla_device._current_proxy_source = None  # skip benching-on-entry for a clean assertion
+    sds = [_scanner_device("proxyA", -50), _scanner_device("proxyB", -80)]
+    monkeypatch.setattr(
+        "tesla_ble.device.bluetooth.async_scanner_devices_by_address",
+        lambda *a, **k: sds,
+        raising=False,
+    )
+    monkeypatch.setattr("tesla_ble.device.time.monotonic", lambda: 1000.0)
+    # Both still cooling; A expires sooner than B.
+    tesla_device._proxy_cooldowns = {"proxyA": 1050.0, "proxyB": 1200.0}
+
+    chosen = tesla_device._select_alternate_proxy_device()
+
+    # Only proxyA released (soonest); proxyB stays benched — no clear-all thrash.
+    assert "proxyA" not in tesla_device._proxy_cooldowns
+    assert tesla_device._proxy_cooldowns.get("proxyB") == 1200.0
+    assert tesla_device._current_proxy_source == "proxyA"
+    assert chosen is sds[0].ble_device
+
+
+# ---------------------------------------------------------------------------
+# Sleep inference: never report "asleep" when the cause is a connection failure
+# ---------------------------------------------------------------------------
+
+
+def test_stale_with_connection_failures_flags_unreachable_not_asleep(monkeypatch, tesla_device):
+    """VCSEC silence WITH connect failures => unreachable, last sleep state untouched."""
+    tesla_device.data["is_asleep"] = False
+    tesla_device.data["ble_unreachable"] = False
+    tesla_device.vehicle_state = VEHICLE_STATE_AWAKE
+    tesla_device._last_vcsec_update = 1000.0
+    tesla_device._consecutive_connection_failures = 3
+    monkeypatch.setattr("tesla_ble.device.time.monotonic", lambda: 1000.0 + 200.0)  # > 180s
+
+    tesla_device._assume_asleep_if_vcsec_stale()
+
+    assert tesla_device.data["ble_unreachable"] is True
+    assert tesla_device.data["is_asleep"] is False  # not a lie about a possibly-charging car
+    assert tesla_device.vehicle_state == VEHICLE_STATE_AWAKE
+
+
+def test_stale_without_failures_assumes_asleep(monkeypatch, tesla_device):
+    """VCSEC silence with NO connect failures keeps the legacy assume-asleep behavior."""
+    tesla_device.data["is_asleep"] = False
+    tesla_device.data["ble_unreachable"] = False
+    tesla_device.vehicle_state = VEHICLE_STATE_AWAKE
+    tesla_device._last_vcsec_update = 1000.0
+    tesla_device._consecutive_connection_failures = 0
+    monkeypatch.setattr("tesla_ble.device.time.monotonic", lambda: 1000.0 + 200.0)
+
+    tesla_device._assume_asleep_if_vcsec_stale()
+
+    assert tesla_device.data["is_asleep"] is True
+    assert tesla_device.vehicle_state == VEHICLE_STATE_ASLEEP
+    assert tesla_device.data["ble_unreachable"] is False
+
+
+def test_not_stale_yet_leaves_state_unchanged(monkeypatch, tesla_device):
+    """Within the staleness window nothing is inferred either way."""
+    tesla_device.data["is_asleep"] = False
+    tesla_device.data["ble_unreachable"] = False
+    tesla_device._last_vcsec_update = 1000.0
+    tesla_device._consecutive_connection_failures = 3
+    monkeypatch.setattr("tesla_ble.device.time.monotonic", lambda: 1000.0 + 60.0)  # < 180s
+
+    tesla_device._assume_asleep_if_vcsec_stale()
+
+    assert tesla_device.data["ble_unreachable"] is False
+    assert tesla_device.data["is_asleep"] is False

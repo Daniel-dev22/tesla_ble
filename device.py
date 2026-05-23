@@ -82,9 +82,13 @@ VCSEC_STALE_THRESHOLD = 180  # seconds without VCSEC responses before assuming a
 CONNECTION_TIMEOUT = 10.0  # Timeout for BLE connection attempts (default bleak is 20s)
 
 # Proxy rotation: when a car is reachable by multiple ESPHome BLE proxies, flip away
-# from a proxy that keeps failing instead of retrying the same one forever.
-PROXY_FLIP_FAILURE_THRESHOLD = 2  # consecutive connect failures before rotating proxies
-PROXY_COOLDOWN = 60.0  # seconds to avoid a proxy after it fails
+# from a proxy that keeps failing instead of retrying the same one forever. Cooldowns use a
+# monotonic clock and grow exponentially per proxy (capped), so a flaky proxy is benched longer
+# each time it fails — but it is ALWAYS released again once its cooldown expires. We never
+# permanently exclude a proxy, so we can't end up sitting dead with no proxy we're willing to try.
+PROXY_FLIP_FAILURE_THRESHOLD = 3  # consecutive connect failures before rotating proxies
+PROXY_COOLDOWN_BASE = 90.0  # base seconds to bench a proxy after a failure (decoupled from poll periods)
+PROXY_COOLDOWN_MAX = 600.0  # cap on the per-proxy exponential backoff
 
 # Push an entity refresh from advertisements at most this often, so the BLE RSSI sensor
 # stays current even while the car is unreachable (no command completions to drive updates).
@@ -238,6 +242,9 @@ class TeslaBleDevice:
         # Device state
         self.data: dict[str, Any] = {}
         self.data["ble_rssi"] = None
+        # True when BLE connections are failing (out of slots / connect timeout). Distinct from
+        # is_asleep: a charging car that we simply can't reach must NOT be reported as asleep.
+        self.data["ble_unreachable"] = False
         self.last_update_time = time.time()  # Initialize to now so entities are available immediately
         self._ble_available = True  # Track BLE availability from coordinator
         self.is_connected = False
@@ -281,8 +288,11 @@ class TeslaBleDevice:
         self._last_rssi_push: float = 0.0
         # Proxy rotation state. In-memory by design: cooldowns track live connectivity, so
         # on restart the next cycle re-evaluates every proxy from scratch (best-RSSI first).
+        # Timers use the monotonic clock so a wall-clock/NTP jump can't prematurely release a
+        # benched proxy or trip the staleness threshold.
         self._current_proxy_source: str | None = None  # proxy of the device we're using
-        self._proxy_cooldowns: dict[str, float] = {}  # proxy source -> unix time it may be retried
+        self._proxy_cooldowns: dict[str, float] = {}  # proxy source -> monotonic time it may be retried
+        self._proxy_fail_streaks: dict[str, int] = {}  # proxy source -> consecutive failures (drives backoff)
         self._proxy_flip_logged: bool = False  # INFO-log first flip per streak, DEBUG the rest
 
         # Cryptography and session management (initialized later to avoid blocking)
@@ -356,12 +366,32 @@ class TeslaBleDevice:
             )
 
     def _assume_asleep_if_vcsec_stale(self) -> None:
-        """Mark the vehicle asleep if we have no VCSEC updates for a while."""
+        """Infer vehicle state from VCSEC silence — but only call it 'asleep' when that's plausible.
+
+        A sleeping Tesla still advertises and answers VCSEC once a connect succeeds, so silence
+        that coincides with connection failures means the car is *unreachable over BLE*, not
+        asleep. Reporting asleep there would lie about a car that may be wide awake and charging
+        (the exact failure we hit: 'out of connection slots' / connect timeout for hours while the
+        car charged). In that case we raise ble_unreachable and leave the last authoritative sleep
+        state untouched. Only genuine silence with no connection errors is treated as sleep.
+        """
         if self._last_vcsec_update == 0:
             return
 
-        now = time.time()
+        now = time.monotonic()
         if now - self._last_vcsec_update < VCSEC_STALE_THRESHOLD:
+            return
+
+        # Silence caused by connection failures is a connectivity problem, not sleep.
+        if self._consecutive_connection_failures > 0:
+            if not self.data.get("ble_unreachable"):
+                _LOGGER.warning(
+                    "No VCSEC response for %.1fs with %d consecutive connection failures; "
+                    "flagging BLE unreachable (NOT asleep) — vehicle may be awake/charging",
+                    now - self._last_vcsec_update,
+                    self._consecutive_connection_failures,
+                )
+            self.data["ble_unreachable"] = True
             return
 
         if not self.data.get("is_asleep", False):
@@ -888,6 +918,16 @@ class TeslaBleDevice:
             _LOGGER.warning("Error updating Tesla device: %s", ex, exc_info=True)
             self.is_connected = False
 
+    def _proxy_cooldown_duration(self, source: str) -> float:
+        """Exponential per-proxy backoff: longer after each consecutive failure, capped.
+
+        Keyed on the proxy's failure streak so a chronically bad proxy is benched progressively
+        longer (up to PROXY_COOLDOWN_MAX) while a momentarily-busy one returns quickly. Streaks
+        reset on a successful connect, so a recovered proxy starts fresh.
+        """
+        streak = self._proxy_fail_streaks.get(source, 1)
+        return min(PROXY_COOLDOWN_BASE * (2 ** (streak - 1)), PROXY_COOLDOWN_MAX)
+
     def _select_alternate_proxy_device(self) -> BLEDevice | None:
         """Pick a connectable BLEDevice from a proxy other than the one we keep failing on.
 
@@ -911,25 +951,37 @@ class TeslaBleDevice:
         if len(scanner_devices) < 2:
             return None  # only one proxy sees the car — nothing to flip to
 
-        now = time.time()
-        # Cool down the proxy we've been failing on, then drop expired cooldowns.
+        now = time.monotonic()
+        # Bench the proxy we've been failing on with an exponential backoff (longer each
+        # consecutive flip-away, capped), then drop cooldowns that have since expired — that
+        # expiry is how a benched proxy is automatically released back into rotation.
         if self._current_proxy_source:
-            self._proxy_cooldowns[self._current_proxy_source] = now + PROXY_COOLDOWN
+            self._proxy_fail_streaks[self._current_proxy_source] = (
+                self._proxy_fail_streaks.get(self._current_proxy_source, 0) + 1
+            )
+            self._proxy_cooldowns[self._current_proxy_source] = (
+                now + self._proxy_cooldown_duration(self._current_proxy_source)
+            )
         self._proxy_cooldowns = {
             source: until for source, until in self._proxy_cooldowns.items() if until > now
         }
 
+        connectable = [sd for sd in scanner_devices if sd.scanner.connectable]
         candidates = [
-            sd
-            for sd in scanner_devices
-            if sd.scanner.connectable and sd.scanner.source not in self._proxy_cooldowns
+            sd for sd in connectable if sd.scanner.source not in self._proxy_cooldowns
         ]
         if not candidates:
-            # Every proxy is cooling down — clear and reconsider all so we never stall.
-            self._proxy_cooldowns.clear()
-            candidates = [sd for sd in scanner_devices if sd.scanner.connectable]
-        if not candidates:
-            return None
+            # Every reachable proxy is still cooling down. Don't forgive them all at once (that
+            # just thrashes); release only the one whose cooldown expires soonest, so we always
+            # keep exactly one path forward and never sit dead with no proxy we'll try.
+            if not connectable:
+                return None
+            soonest = min(
+                connectable,
+                key=lambda sd: self._proxy_cooldowns.get(sd.scanner.source, 0.0),
+            )
+            self._proxy_cooldowns.pop(soonest.scanner.source, None)
+            candidates = [soonest]
 
         best = max(
             candidates,
@@ -1029,7 +1081,9 @@ class TeslaBleDevice:
             self._notifications_started = True
             self._consecutive_connection_failures = 0  # Reset on success
             self._proxy_cooldowns.clear()  # this proxy works; forget prior cooldowns
+            self._proxy_fail_streaks.clear()  # and reset their backoff streaks
             self._proxy_flip_logged = False  # re-arm INFO logging for the next streak
+            self.data["ble_unreachable"] = False  # a successful connect proves we can reach the car
             self._last_successful_connection = time.time()
             _LOGGER.debug("Connected to Tesla BLE device %s via proxy %s",
                           ble_device.address, self._current_proxy_source)
@@ -1534,7 +1588,10 @@ class TeslaBleDevice:
 
             if sub_message == "vehicleStatus":
                 status = vcsec_message.vehicleStatus
-                self._last_vcsec_update = time.time()
+                self._last_vcsec_update = time.monotonic()
+                if self.data.get("ble_unreachable"):
+                    _LOGGER.info("BLE reachable again — VCSEC responding (was flagged unreachable)")
+                    self.data["ble_unreachable"] = False
 
                 previous_asleep = self.vehicle_state == VEHICLE_STATE_ASLEEP
                 current_asleep = (

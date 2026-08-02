@@ -52,7 +52,12 @@ from .const import (
     VEHICLE_STATE_AWAKE,
     WRITE_UUID,
 )
-from .messages import IncompleteMessageError, TeslaMessageDecoder
+from .messages import (
+    MAX_MESSAGE_LENGTH,
+    FramingError,
+    IncompleteMessageError,
+    TeslaMessageDecoder,
+)
 from .protocol import (
     ACTION_SPECIFICS,
     ActionMessageDetail,
@@ -77,6 +82,16 @@ FOLLOW_UP_DELAY_MECHANICAL = 3.0  # Delay for mechanical actuators (charge port,
 SESSION_RETRY_MAX_DELAY = 8.0
 WAKE_RETRY_MAX_DELAY = 20.0
 VCSEC_STALE_THRESHOLD = 180  # seconds without VCSEC responses before assuming asleep
+
+# Hard cap on buffered, undecoded notification bytes. Must exceed MAX_MESSAGE_LENGTH
+# (a single legitimate frame has to fit) with headroom for a few queued frames,
+# while still bounding memory if the stream desynchronises. Exceeding it forces a
+# resync. This is the backstop; the length-prefix check usually resyncs first.
+MAX_RX_BUFFER = 4 * MAX_MESSAGE_LENGTH
+# Minimum gap between decode-failure recoveries. Recovery invalidates both domain
+# sessions, so running it per failed packet (as the old code did) meant ~1 full
+# session teardown per second during a desync storm.
+DECODE_RECOVERY_COOLDOWN = 30.0
 
 # Connection optimization constants
 CONNECTION_TIMEOUT = 10.0  # Timeout for BLE connection attempts (default bleak is 20s)
@@ -186,6 +201,8 @@ _LOGGER = logging.getLogger(__name__)
 BLE_WRITE_MAX_ATTEMPTS = 1  # Fail fast - single attempt, command timeout handles retry
 BLE_WRITE_RETRY_BACKOFF = 0.3
 BLE_WRITE_TIMEOUT = 5.0  # Allow longer BLE writes before transport-level retry kicks in
+BLE_ATT_HEADER_SIZE = 3  # ATT opcode + handle overhead deducted from the MTU
+BLE_DEFAULT_CHUNK_SIZE = 20  # Payload of the guaranteed 23-byte minimum ATT MTU
 
 
 class TeslaBleDevice:
@@ -217,6 +234,9 @@ class TeslaBleDevice:
         self.hass = hass
         self._config_entry: ConfigEntry | None = entry
         self._data_update_callback: Callable[[], None] | None = None
+        # Every log line carries this so multi-vehicle installs can tell which car
+        # emitted it — previously two vehicles produced byte-identical messages.
+        self._log_prefix = f"[{vin[-6:]}] " if vin else ""
 
         # Handle key formats - convert bytes to hex strings for storage
         if isinstance(private_key, bytes):
@@ -274,8 +294,17 @@ class TeslaBleDevice:
         # action to complete. During this delay, we ignore any stale polling GET responses.
         self._ignored_get_actions: set[BLECarServerVehicleAction] = set()
         self._response_buffer = bytearray()
+        # Serialises whole outbound messages so two multi-chunk writes can never
+        # interleave on the characteristic (which would desync the car's own
+        # reassembler, not just ours).
+        self._write_lock = asyncio.Lock()
         self._write_with_response = True
         self._decode_recovery_task: asyncio.Task | None = None
+        # Decode-failure bookkeeping: recovery is debounced and repeat failures are
+        # logged once per episode rather than once per BLE notification.
+        self._decode_failures: int = 0
+        self._decode_failure_started: float = 0.0
+        self._last_decode_recovery: float = 0.0
         self._last_vcsec_update: float = 0.0
         self._was_out_of_range: bool = False  # Track if vehicle was out of range in previous cycle
 
@@ -305,6 +334,26 @@ class TeslaBleDevice:
         self._pairing_failure_reason: str | None = None
         self._pairing_wait_info: int | None = None
         self._pairing_error_info: int | None = None
+
+        # Polling configuration and cadence state. Initialised here so the object is
+        # fully formed at construction; load_polling_parameters() overwrites these from
+        # the config entry options during setup. These used to be initialised only
+        # inside _recover_from_decode_failure, which made a decode failure silently
+        # reset the user's configured polling — and left should_poll() raising
+        # AttributeError on any path that ran before a decode failure.
+        self.update_interval = DEFAULT_UPDATE_INTERVAL
+        self.post_wake_poll_time = DEFAULT_POST_WAKE_POLL_TIME
+        self.poll_data_period = DEFAULT_POLL_DATA_PERIOD
+        self.poll_asleep_period = DEFAULT_POLL_ASLEEP_PERIOD
+        self.poll_charging_period = DEFAULT_POLL_CHARGING_PERIOD
+        self.ble_disconnected_min_time = DEFAULT_BLE_DISCONNECTED_MIN_TIME
+        self.fast_poll_if_unlocked = bool(DEFAULT_FAST_POLL_IF_UNLOCKED)
+        self.wake_on_boot = bool(DEFAULT_WAKE_ON_BOOT)
+        self._last_wake_time = 0
+        self._car_just_woken = False
+        self._is_charging = False
+        self._charging_just_started = False
+        self._last_poll_time = 0
 
         # Protocol components
         self.decoder = TeslaMessageDecoder()
@@ -359,11 +408,30 @@ class TeslaBleDevice:
         command.timeout_handle = loop.call_later(delay, _timeout_callback)
 
     def _handle_decode_failure(self) -> None:
-        """Kick off recovery when we fail to parse an incoming protobuf message."""
-        if self._decode_recovery_task is None or self._decode_recovery_task.done():
-            self._decode_recovery_task = self._spawn_task(
-                self._recover_from_decode_failure(), "decode_recovery"
+        """Kick off recovery when we fail to parse an incoming protobuf message.
+
+        Debounced: recovery invalidates both domain sessions and issues two
+        SessionInfo requests, so firing it per failed packet turned a single
+        desync into ~1 full session teardown per second. One recovery per
+        DECODE_RECOVERY_COOLDOWN is enough to resynchronise.
+        """
+        if self._decode_recovery_task is not None and not self._decode_recovery_task.done():
+            return
+
+        now = time.monotonic()
+        if now - self._last_decode_recovery < DECODE_RECOVERY_COOLDOWN:
+            _LOGGER.debug(
+                "%sSkipping decode recovery; last ran %.1fs ago (cooldown %.0fs)",
+                self._log_prefix,
+                now - self._last_decode_recovery,
+                DECODE_RECOVERY_COOLDOWN,
             )
+            return
+
+        self._last_decode_recovery = now
+        self._decode_recovery_task = self._spawn_task(
+            self._recover_from_decode_failure(), "decode_recovery"
+        )
 
     def _assume_asleep_if_vcsec_stale(self) -> None:
         """Infer vehicle state from VCSEC silence — but only call it 'asleep' when that's plausible.
@@ -386,8 +454,9 @@ class TeslaBleDevice:
         if self._consecutive_connection_failures > 0:
             if not self.data.get("ble_unreachable"):
                 _LOGGER.warning(
-                    "No VCSEC response for %.1fs with %d consecutive connection failures; "
+                    "%sNo VCSEC response for %.1fs with %d consecutive connection failures; "
                     "flagging BLE unreachable (NOT asleep) — vehicle may be awake/charging",
+                    self._log_prefix,
                     now - self._last_vcsec_update,
                     self._consecutive_connection_failures,
                 )
@@ -430,34 +499,24 @@ class TeslaBleDevice:
             await self._send_session_info_request(UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY)
         except Exception as ex:
             _LOGGER.warning(
-                "Unable to send VCSEC SessionInfo after decode failure: %s", ex
+                "%sUnable to send VCSEC SessionInfo after decode failure: %s", self._log_prefix, ex
             )
         try:
             await self._send_session_info_request(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
         except Exception as ex:
             _LOGGER.warning(
-                "Unable to send Infotainment SessionInfo after decode failure: %s", ex
+                "%sUnable to send Infotainment SessionInfo after decode failure: %s", self._log_prefix, ex
             )
 
         await self._process_domain_queue(UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY)
         await self._process_domain_queue(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
 
-        # Polling configuration (matching ESPHome)
-        self.update_interval = DEFAULT_UPDATE_INTERVAL
-        self.post_wake_poll_time = DEFAULT_POST_WAKE_POLL_TIME
-        self.poll_data_period = DEFAULT_POLL_DATA_PERIOD
-        self.poll_asleep_period = DEFAULT_POLL_ASLEEP_PERIOD
-        self.poll_charging_period = DEFAULT_POLL_CHARGING_PERIOD
-        self.ble_disconnected_min_time = DEFAULT_BLE_DISCONNECTED_MIN_TIME
-        self.fast_poll_if_unlocked = DEFAULT_FAST_POLL_IF_UNLOCKED
-        self.wake_on_boot = DEFAULT_WAKE_ON_BOOT
-
-        # Polling state tracking
-        self._last_wake_time = 0
-        self._car_just_woken = False
-        self._is_charging = False
-        self._charging_just_started = False  # Track first detection of charging (ESPHome car_is_charging_ == 1)
-        self._last_poll_time = 0
+        # NOTE: polling configuration and cadence state are deliberately NOT reset
+        # here. They belong to the config entry (see load_polling_parameters) and to
+        # the poll loop, not to transport recovery. Resetting them used to discard
+        # the user's configured intervals on every stray byte, and zeroing
+        # _last_poll_time forced an extra Infotainment poll per decode failure —
+        # amplifying the very storm this function is trying to end.
 
     def load_polling_parameters(
         self,
@@ -495,7 +554,7 @@ class TeslaBleDevice:
         try:
             stored = await self._store.async_load()
         except Exception as err:
-            _LOGGER.warning("Unable to load Tesla BLE persistent state, will retry: %s", err)
+            _LOGGER.warning("%sUnable to load Tesla BLE persistent state, will retry: %s", self._log_prefix, err)
             return  # Intentionally do NOT latch — let the next cycle try again.
 
         if stored:
@@ -508,7 +567,7 @@ class TeslaBleDevice:
                     self._session_blobs = sessions
                     _LOGGER.debug("Restored %d Tesla BLE sessions", len(sessions))
                 except Exception as err:
-                    _LOGGER.warning("Failed to restore Tesla BLE sessions: %s", err)
+                    _LOGGER.warning("%sFailed to restore Tesla BLE sessions: %s", self._log_prefix, err)
             # Polling parameters are sourced exclusively from the config entry options;
             # disk-store polling overrides removed to avoid divergence.
 
@@ -565,7 +624,7 @@ class TeslaBleDevice:
             try:
                 await self._store.async_save(payload)
             except Exception as err:
-                _LOGGER.warning("Failed to persist Tesla BLE state: %s", err)
+                _LOGGER.warning("%sFailed to persist Tesla BLE state: %s", self._log_prefix, err)
 
     async def _initialize_crypto(self) -> None:
         """Initialize crypto manager + protocol client and load the private key.
@@ -849,7 +908,7 @@ class TeslaBleDevice:
                         await self._reinitialize_crypto()
                     except Exception as ex:
                         _LOGGER.error(
-                            "Crypto reinitialization failed on returning to BLE range; will retry next cycle: %s",
+                            "%sCrypto reinitialization failed on returning to BLE range; will retry next cycle: %s", self._log_prefix,
                             ex,
                             exc_info=True,
                         )
@@ -915,7 +974,7 @@ class TeslaBleDevice:
                     self._car_just_woken = False
 
         except Exception as ex:
-            _LOGGER.warning("Error updating Tesla device: %s", ex, exc_info=True)
+            _LOGGER.warning("%sError updating Tesla device: %s", self._log_prefix, ex, exc_info=True)
             self.is_connected = False
 
     def _proxy_cooldown_duration(self, source: str) -> float:
@@ -1070,6 +1129,11 @@ class TeslaBleDevice:
             _LOGGER.debug("_connect: establish_connection returned, client=%s, is_connected=%s",
                          self._client, self._client.is_connected if self._client else False)
 
+            # Start every connection with an empty receive buffer. A torn frame left
+            # over from the previous link would otherwise be prepended to the new
+            # stream, permanently desynchronising a perfectly healthy connection.
+            self._reset_response_buffer("connect")
+
             _LOGGER.debug("_connect: starting notifications...")
             await self._client.start_notify(READ_UUID, self._handle_notification)
             _LOGGER.debug("_connect: notifications started")
@@ -1089,7 +1153,7 @@ class TeslaBleDevice:
                           ble_device.address, self._current_proxy_source)
 
         except (BleakError, TimeoutError, RuntimeError) as ex:
-            _LOGGER.error("Failed to connect to Tesla device: %s", ex)
+            _LOGGER.error("%sFailed to connect to Tesla device: %s", self._log_prefix, ex)
             self.is_connected = False
             self._notifications_started = False
             self._consecutive_connection_failures += 1
@@ -1102,12 +1166,31 @@ class TeslaBleDevice:
                 self._client = None
             raise
 
+    def _reset_response_buffer(self, reason: str) -> None:
+        """Drop any partially received frame; the byte stream is about to restart.
+
+        Called on every connect/disconnect transition. Without this the buffer
+        outlives the link it belongs to, so one torn frame poisons every subsequent
+        connection and only an HA restart clears it.
+        """
+        if self._response_buffer:
+            _LOGGER.debug(
+                "%sDiscarding %d buffered RX byte(s) on %s",
+                self._log_prefix,
+                len(self._response_buffer),
+                reason,
+            )
+            self._response_buffer.clear()
+        self._decode_failures = 0
+        self._decode_failure_started = 0.0
+
     def _handle_disconnect(self, client: BleakClientWithServiceCache) -> None:
         """Handle disconnection from BLE device."""
-        _LOGGER.debug("Disconnected from Tesla BLE device")
+        _LOGGER.debug("%sDisconnected from Tesla BLE device", self._log_prefix)
         self.is_connected = False
         self._notifications_started = False
         self._client = None  # Clear stale client reference to force reconnect
+        self._reset_response_buffer("disconnect callback")
 
     async def _disconnect(self) -> None:
         """Disconnect from the Tesla BLE device."""
@@ -1124,6 +1207,7 @@ class TeslaBleDevice:
         self.is_connected = False
         self._notifications_started = False
         self._client = None  # Clear client to prevent stale service cache issues
+        self._reset_response_buffer("disconnect")
 
         if self.address:
             try:
@@ -1138,36 +1222,105 @@ class TeslaBleDevice:
         only needed in _process_response_buffer where reads span awaits.
         """
         try:
-            self._spawn_task(self._log_ble_bytes("RX", data), "log_ble_rx")
+            if self._ble_log_path:
+                self._spawn_task(self._log_ble_bytes("RX", data), "log_ble_rx")
             self._response_buffer.extend(data)
             await self._process_response_buffer()
         except Exception as ex:
-            _LOGGER.error("Error handling notification: %s", ex, exc_info=True)
+            _LOGGER.error("%sError handling notification: %s", self._log_prefix, ex, exc_info=True)
 
     async def _process_response_buffer(self) -> None:
-        """Process accumulated response data.
+        """Process accumulated response data, resynchronising on malformed frames.
 
         Why locked: reads/decodes span awaits during _handle_universal_message. Without
-        the lock, a concurrent invocation could read the same prefix twice, and the old
-        decode-failure path called self._response_buffer.clear() which would discard
-        bytes that just arrived from a later notification.
+        the lock a concurrent invocation could read the same prefix twice.
+
+        Why the whole examined window is discarded on a framing error: the stream is
+        length-prefixed with no sync marker, so once it is misaligned no byte offset
+        can be trusted. The previous implementation dropped a *single* leading byte
+        and returned, consuming 1 byte per notification while each notification
+        appended up to 20 — a guaranteed livelock that produced ~29k errors/19 days
+        and never resynchronised. Snapshotting the length before the decode attempt
+        (rather than calling clear()) guarantees we never discard bytes appended by a
+        later notification while we were awaiting.
+
+        A discarded response is safe: every command has a response timeout and retries.
         """
         async with self._buffer_lock:
             while self._response_buffer:
+                # A real frame is at most MAX_MESSAGE_LENGTH; anything beyond this cap
+                # means we are accumulating garbage, so reset rather than grow forever.
+                if len(self._response_buffer) > MAX_RX_BUFFER:
+                    dropped = len(self._response_buffer)
+                    self._response_buffer.clear()
+                    _LOGGER.warning(
+                        "%sRX buffer exceeded %d bytes; discarded %d bytes and resynchronising",
+                        self._log_prefix,
+                        MAX_RX_BUFFER,
+                        dropped,
+                    )
+                    self._handle_decode_failure()
+                    return
+
+                examined = len(self._response_buffer)
                 try:
                     message, consumed = self.decoder.decode_universal_message(bytes(self._response_buffer))
                 except IncompleteMessageError:
                     return
-                except Exception as ex:
-                    _LOGGER.error("Failed to decode UniversalMessage: %s", ex)
-                    # Drop only the leading byte and retry; clearing the whole buffer
-                    # would discard bytes appended after this decode attempt started.
-                    del self._response_buffer[:1]
-                    self._handle_decode_failure()
-                    return
+                except FramingError as ex:
+                    # Expected when the stream is desynchronised. Discard exactly what
+                    # we inspected — no await happens between the snapshot and this
+                    # delete, so `examined` is still the live buffer length.
+                    del self._response_buffer[:examined]
+                    self._note_decode_failure(ex)
+                    continue
+                except Exception as ex:  # pragma: no cover - decoder bug, not a desync
+                    # Never seen in practice; log with a traceback rather than
+                    # quietly filing it as a framing problem, but still resync so a
+                    # decoder bug cannot wedge the buffer.
+                    _LOGGER.exception("%sUnexpected decoder failure", self._log_prefix)
+                    del self._response_buffer[:examined]
+                    self._note_decode_failure(ex)
+                    continue
 
                 del self._response_buffer[:consumed]
+                self._note_decode_success()
                 await self._handle_universal_message(message)
+
+    def _note_decode_failure(self, ex: Exception) -> None:
+        """Record a framing failure, logging once per episode instead of per packet.
+
+        Per the logging-in-loops rule: first failure of an episode is ERROR, the rest
+        are DEBUG, and _note_decode_success emits a single summary on recovery.
+        """
+        now = time.monotonic()
+        if self._decode_failures == 0:
+            self._decode_failure_started = now
+            _LOGGER.error(
+                "%sFailed to decode UniversalMessage: %s — resynchronising", self._log_prefix, ex
+            )
+        else:
+            _LOGGER.debug(
+                "%sFailed to decode UniversalMessage (%d in this episode): %s",
+                self._log_prefix,
+                self._decode_failures + 1,
+                ex,
+            )
+        self._decode_failures += 1
+        self._handle_decode_failure()
+
+    def _note_decode_success(self) -> None:
+        """Close out a decode-failure episode once a frame parses again."""
+        if self._decode_failures == 0:
+            return
+        _LOGGER.warning(
+            "%sResynchronised after %d decode failure(s) over %.1fs",
+            self._log_prefix,
+            self._decode_failures,
+            time.monotonic() - self._decode_failure_started,
+        )
+        self._decode_failures = 0
+        self._decode_failure_started = 0.0
 
     async def _handle_universal_message(self, message) -> None:
         """Route UniversalMessage to appropriate domain handlers."""
@@ -1229,7 +1382,7 @@ class TeslaBleDevice:
             except Exception as ex:  # pragma: no cover - stale session recovery
                 payload_hex = message.protobuf_message_as_bytes.hex() if message.HasField("protobuf_message_as_bytes") else "none"
                 _LOGGER.warning(
-                    "Failed to parse VCSEC response (likely stale session): %s - payload_len=%d payload_hex=%s - invalidating session and disconnecting",
+                    "%sFailed to parse VCSEC response (likely stale session): %s - payload_len=%d payload_hex=%s - invalidating session and disconnecting", self._log_prefix,
                     ex,
                     len(message.protobuf_message_as_bytes) if message.HasField("protobuf_message_as_bytes") else 0,
                     payload_hex[:100] if len(payload_hex) > 100 else payload_hex,
@@ -1256,7 +1409,7 @@ class TeslaBleDevice:
             except Exception as ex:  # pragma: no cover - stale session recovery
                 payload_hex = message.protobuf_message_as_bytes.hex() if message.HasField("protobuf_message_as_bytes") else "none"
                 _LOGGER.warning(
-                    "Failed to parse CarServer response (likely stale session): %s - payload_len=%d payload_hex=%s - invalidating session and disconnecting",
+                    "%sFailed to parse CarServer response (likely stale session): %s - payload_len=%d payload_hex=%s - invalidating session and disconnecting", self._log_prefix,
                     ex,
                     len(message.protobuf_message_as_bytes) if message.HasField("protobuf_message_as_bytes") else 0,
                     payload_hex[:100] if len(payload_hex) > 100 else payload_hex,
@@ -1312,7 +1465,7 @@ class TeslaBleDevice:
             if self._persistent_state_loaded:
                 self._schedule_state_save()
         except Exception as ex:
-            _LOGGER.error("Failed to update session info for domain %s: %s", domain, ex)
+            _LOGGER.error("%sFailed to update session info for domain %s: %s", self._log_prefix, domain, ex)
             return
 
         updated = False
@@ -1354,7 +1507,7 @@ class TeslaBleDevice:
             await self._send_session_info_request(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
 
         except Exception as ex:
-            _LOGGER.error("Failed to initialize sessions: %s", ex)
+            _LOGGER.error("%sFailed to initialize sessions: %s", self._log_prefix, ex)
             raise
 
     async def _send_session_info_request(self, domain: UniversalMessageDomain) -> None:
@@ -1365,12 +1518,12 @@ class TeslaBleDevice:
         # only fail loudly if that doesn't restore a usable key.
         if not self._crypto_ready:
             _LOGGER.warning(
-                "Crypto not ready for domain %s; attempting reinitialization", domain
+                "%sCrypto not ready for domain %s; attempting reinitialization", self._log_prefix, domain
             )
             try:
                 await self._initialize_crypto()
             except Exception as ex:
-                _LOGGER.error("Crypto recovery failed: %s", ex, exc_info=True)
+                _LOGGER.error("%sCrypto recovery failed: %s", self._log_prefix, ex, exc_info=True)
                 raise
             if not self._crypto_ready:
                 raise RuntimeError(
@@ -1387,7 +1540,7 @@ class TeslaBleDevice:
             await self._write_ble_data(message)
 
         except Exception as ex:
-            _LOGGER.error("Failed to send session info request: %s", ex)
+            _LOGGER.error("%sFailed to send session info request: %s", self._log_prefix, ex)
             raise
 
     async def _log_ble_bytes(self, direction: str, payload: bytes) -> None:
@@ -1416,79 +1569,133 @@ class TeslaBleDevice:
         else:
             await loop.run_in_executor(None, _write_line)
 
-    async def _write_ble_data(self, data: bytes) -> None:
-        """Write data to BLE characteristic."""
-        # Connection will be established automatically in _write_ble_chunk if needed
-        # Split large messages into chunks if needed
-        chunk_size = 20  # Standard BLE MTU
+    def _chunk_size(self) -> int:
+        """Payload bytes per GATT write, derived from the negotiated MTU.
 
-        self._spawn_task(self._log_ble_bytes("TX", data), "log_ble_tx")
+        The old hardcoded 20 ignored the MTU that ESPHome proxies actually
+        negotiate, so every message took 4-8x more writes than necessary — and
+        each extra write is another chance to fail partway through a message.
+        """
+        mtu = getattr(self._client, "mtu_size", None) if self._client else None
+        if not isinstance(mtu, int) or mtu <= BLE_ATT_HEADER_SIZE:
+            return BLE_DEFAULT_CHUNK_SIZE
+        return max(BLE_DEFAULT_CHUNK_SIZE, min(mtu - BLE_ATT_HEADER_SIZE, MAX_MESSAGE_LENGTH))
 
-        for i in range(0, len(data), chunk_size):
-            chunk = data[i:i + chunk_size]
-            await self._write_ble_chunk(chunk)
+    async def _ensure_link_ready(self) -> None:
+        """Connect and enable notifications before any part of a message is sent.
 
-        _LOGGER.debug("Sent %d bytes to Tesla device", len(data))
-
-    async def _write_ble_chunk(self, chunk: bytes) -> None:
-        """Write a single BLE chunk with retries and timeouts."""
+        Doing this once per message (rather than per chunk) is what makes a
+        multi-chunk write atomic: the link can no longer be re-established
+        *between* chunks, which would deliver the tail of a message on a fresh
+        connection and leave the car reassembling a fragment.
+        """
         last_exception: Exception | None = None
-        attempt = 0
 
-        _LOGGER.debug("_write_ble_chunk: _client=%s, is_connected=%s, _notifications_started=%s",
-                     self._client is not None, self._client.is_connected if self._client else False, self._notifications_started)
-
-        while attempt < BLE_WRITE_MAX_ATTEMPTS:
+        for attempt in range(BLE_WRITE_MAX_ATTEMPTS):
             if not self._client or not self._client.is_connected:
-                # Check if device is in BLE range before attempting connection
                 if self.hass and self.address:
-                    in_range = bluetooth.async_address_present(self.hass, self.address, connectable=True)
-                    if not in_range:
-                        _LOGGER.debug("Vehicle not in BLE range, skipping connection attempt")
+                    if not bluetooth.async_address_present(self.hass, self.address, connectable=True):
+                        _LOGGER.debug("%sVehicle not in BLE range, skipping connection attempt", self._log_prefix)
                         raise BleakError("Vehicle not in BLE range")
-
                 try:
-                    _LOGGER.debug("Attempting to connect (attempt %d/%d)", attempt + 1, BLE_WRITE_MAX_ATTEMPTS)
+                    _LOGGER.debug(
+                        "%sAttempting to connect (attempt %d/%d)",
+                        self._log_prefix, attempt + 1, BLE_WRITE_MAX_ATTEMPTS,
+                    )
                     await self._connect()
-                except Exception as err:  # pragma: no cover - defensive guard
-                    # Check if it's a range issue vs actual connection error
+                except Exception as err:
+                    in_range = True
                     if self.hass and self.address:
                         in_range = bluetooth.async_address_present(self.hass, self.address, connectable=True)
-                        if not in_range:
-                            _LOGGER.debug("Connection failed - vehicle not in BLE range")
-                        else:
-                            _LOGGER.warning("Connection attempt %d/%d failed: %s", attempt + 1, BLE_WRITE_MAX_ATTEMPTS, err)
+                    if in_range:
+                        _LOGGER.warning(
+                            "%sConnection attempt %d/%d failed: %s",
+                            self._log_prefix, attempt + 1, BLE_WRITE_MAX_ATTEMPTS, err,
+                        )
                     else:
-                        _LOGGER.warning("Connection attempt %d/%d failed: %s", attempt + 1, BLE_WRITE_MAX_ATTEMPTS, err)
+                        _LOGGER.debug("%sConnection failed - vehicle not in BLE range", self._log_prefix)
                     last_exception = err
-                    attempt += 1
-                    await asyncio.sleep(BLE_WRITE_RETRY_BACKOFF)
+                    if attempt + 1 < BLE_WRITE_MAX_ATTEMPTS:
+                        await asyncio.sleep(BLE_WRITE_RETRY_BACKOFF)
                     continue
 
-            # Ensure notifications are started even if connection already existed
             if self._client and self._client.is_connected and not self._notifications_started:
                 try:
-                    _LOGGER.debug("Starting BLE notifications for existing connection")
+                    _LOGGER.debug("%sStarting BLE notifications for existing connection", self._log_prefix)
                     await self._client.start_notify(READ_UUID, self._handle_notification)
                     if self.protocol_client:
                         self.protocol_client.set_connection_id()
                     self._notifications_started = True
-                    _LOGGER.debug("BLE notifications started successfully")
                 except Exception as err:
-                    # If notifications are already enabled, treat it as success
-                    err_str = str(err).lower()
-                    _LOGGER.debug("Notification error string: '%s', contains 'already enabled': %s", err_str, "already enabled" in err_str)
-                    if "already enabled" in err_str:
-                        _LOGGER.debug("Notifications already enabled, proceeding")
+                    if "already enabled" in str(err).lower():
+                        _LOGGER.debug("%sNotifications already enabled, proceeding", self._log_prefix)
                         self._notifications_started = True
                         if self.protocol_client:
                             self.protocol_client.set_connection_id()
                     else:
-                        _LOGGER.error("Failed to start notifications: %s", err)
+                        _LOGGER.error("%sFailed to start notifications: %s", self._log_prefix, err)
                         last_exception = err
-                        attempt += 1
-                        await asyncio.sleep(BLE_WRITE_RETRY_BACKOFF)
+                        if attempt + 1 < BLE_WRITE_MAX_ATTEMPTS:
+                            await asyncio.sleep(BLE_WRITE_RETRY_BACKOFF)
                         continue
+
+            if self._client and self._client.is_connected:
+                return
+
+        if last_exception:
+            raise RuntimeError("Failed to establish BLE link") from last_exception
+        raise RuntimeError("Failed to establish BLE link")
+
+    async def _write_ble_data(self, data: bytes) -> None:
+        """Write one complete message to the BLE characteristic, atomically.
+
+        Held under _write_lock so two messages can never interleave their chunks
+        on the characteristic, and the link is established up-front so it cannot
+        be swapped mid-message. If a chunk still fails after some of the message
+        is on the wire, the link is torn down: the car is holding a partial frame
+        and appending the next message to it would desynchronise its reassembler.
+        """
+        async with self._write_lock:
+            await self._ensure_link_ready()
+
+            if self._ble_log_path:
+                self._spawn_task(self._log_ble_bytes("TX", data), "log_ble_tx")
+
+            chunk_size = self._chunk_size()
+            sent = 0
+            try:
+                for i in range(0, len(data), chunk_size):
+                    await self._write_ble_chunk(data[i:i + chunk_size])
+                    sent = min(i + chunk_size, len(data))
+            except Exception:
+                if sent:
+                    _LOGGER.warning(
+                        "%sWrite failed after %d/%d bytes of a message; dropping the link "
+                        "so both ends resynchronise",
+                        self._log_prefix, sent, len(data),
+                    )
+                await self._disconnect()
+                raise
+
+            _LOGGER.debug(
+                "%sSent %d bytes to Tesla device in %d chunk(s) of %d",
+                self._log_prefix, len(data),
+                (len(data) + chunk_size - 1) // chunk_size or 1, chunk_size,
+            )
+
+    async def _write_ble_chunk(self, chunk: bytes) -> None:
+        """Write a single chunk on an already-established link.
+
+        Deliberately does NOT connect. Establishing a connection here would let a
+        reconnect happen between two chunks of the same message; _write_ble_data
+        owns link setup instead.
+        """
+        last_exception: Exception | None = None
+        attempt = 0
+
+        while attempt < BLE_WRITE_MAX_ATTEMPTS:
+            if not self._client or not self._client.is_connected:
+                raise BleakError("BLE link went down mid-message")
 
             try:
                 write_coro = self._client.write_gatt_char(
@@ -1500,39 +1707,29 @@ class TeslaBleDevice:
                 return
             except asyncio.TimeoutError as err:
                 _LOGGER.debug(
-                    "BLE write timed out (attempt %s/%s)",
-                    attempt + 1,
-                    BLE_WRITE_MAX_ATTEMPTS,
+                    "%sBLE write timed out (attempt %s/%s)",
+                    self._log_prefix, attempt + 1, BLE_WRITE_MAX_ATTEMPTS,
                 )
                 last_exception = err
             except BleakError as err:
                 error_text = str(err).lower()
                 if self._write_with_response and "not support" in error_text:
                     _LOGGER.debug(
-                        "Write-with-response unsupported; falling back to write-without-response"
+                        "%sWrite-with-response unsupported; falling back to write-without-response",
+                        self._log_prefix,
                     )
                     self._write_with_response = False
                     continue
                 _LOGGER.debug(
-                    "BLE write failed (attempt %s/%s): %s",
-                    attempt + 1,
-                    BLE_WRITE_MAX_ATTEMPTS,
-                    err,
+                    "%sBLE write failed (attempt %s/%s): %s",
+                    self._log_prefix, attempt + 1, BLE_WRITE_MAX_ATTEMPTS, err,
                 )
                 last_exception = err
             except Exception as err:  # pragma: no cover - defensive guard
                 last_exception = err
-                _LOGGER.debug("Unexpected BLE write error: %s", err)
+                _LOGGER.debug("%sUnexpected BLE write error: %s", self._log_prefix, err)
 
             attempt += 1
-
-            if self._client and self._client.is_connected:
-                try:
-                    await self._client.disconnect()
-                except Exception:  # pragma: no cover - defensive guard
-                    pass
-            self._client = None
-            self.is_connected = False
 
             if attempt < BLE_WRITE_MAX_ATTEMPTS:
                 await asyncio.sleep(BLE_WRITE_RETRY_BACKOFF)
@@ -1655,7 +1852,7 @@ class TeslaBleDevice:
                 elif op_status == vcsec_pb2.OperationStatus_E.OPERATIONSTATUS_WAIT:
                     self._requeue_domain_command(UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY)
                 elif op_status == vcsec_pb2.OperationStatus_E.OPERATIONSTATUS_ERROR:
-                    _LOGGER.error("VCSEC command returned ERROR status")
+                    _LOGGER.error("%sVCSEC command returned ERROR status", self._log_prefix)
                     self._complete_domain_command(UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY)
 
                 sub_status = command_status.WhichOneof("sub_message")
@@ -1691,7 +1888,7 @@ class TeslaBleDevice:
                         self._pairing_error_info = info
                         self._pairing_failure_reason = self._pairing_reason_from_info(info)
                         _LOGGER.error(
-                            "Tesla BLE pairing failed: %s (%s)",
+                            "%sTesla BLE pairing failed: %s (%s)", self._log_prefix,
                             info,
                             info_name,
                         )
@@ -1708,7 +1905,7 @@ class TeslaBleDevice:
 
             if sub_message == "nominalError":
                 _LOGGER.error(
-                    "Received VCSEC nominal error: %s",
+                    "%sReceived VCSEC nominal error: %s", self._log_prefix,
                     vcsec_message.nominalError.genericError,
                 )
                 self._complete_domain_command(UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY)
@@ -1717,7 +1914,7 @@ class TeslaBleDevice:
             _LOGGER.debug("Unhandled VCSEC sub-message: %s", sub_message)
 
         except Exception as ex:
-            _LOGGER.error("Error handling VCSEC response: %s", ex)
+            _LOGGER.error("%sError handling VCSEC response: %s", self._log_prefix, ex)
 
     async def _handle_infotainment_response(self, parsed: ParsedCarServerResponse) -> None:
         """Handle Infotainment responses using protobuf structures."""
@@ -1735,7 +1932,7 @@ class TeslaBleDevice:
             # Check for signedMessageStatus faults (e.g., TIME_EXPIRED)
             if parsed.fault != 0:
                 fault_name = universal_message_pb2.MessageFault_E.Name(parsed.fault) if parsed.fault else "UNKNOWN"
-                _LOGGER.warning("Infotainment response had fault %s (%s)", parsed.fault, fault_name)
+                _LOGGER.warning("%sInfotainment response had fault %s (%s)", self._log_prefix, parsed.fault, fault_name)
 
                 # TIME_EXPIRED means stale session - invalidate and let command retry
                 if parsed.fault == universal_message_pb2.MessageFault_E.MESSAGEFAULT_ERROR_TIME_EXPIRED:
@@ -1770,7 +1967,7 @@ class TeslaBleDevice:
                         _LOGGER.debug("Command %s returned benign error '%s'", active_command.execute_name, reason)
                         status.result = car_server_pb2.OperationStatus_E.OPERATIONSTATUS_OK
                     else:
-                        _LOGGER.error("Command %s failed: %s", active_command.execute_name, reason or "unknown")
+                        _LOGGER.error("%sCommand %s failed: %s", self._log_prefix, active_command.execute_name, reason or "unknown")
                         self._complete_domain_command(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
                         return
 
@@ -1962,7 +2159,7 @@ class TeslaBleDevice:
                 self._complete_domain_command(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
 
         except Exception as ex:
-            _LOGGER.error("Error handling Infotainment response: %s", ex, exc_info=True)
+            _LOGGER.error("%sError handling Infotainment response: %s", self._log_prefix, ex, exc_info=True)
             # Complete the command so queue doesn't get stuck
             self._complete_domain_command(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
 
@@ -2216,7 +2413,7 @@ class TeslaBleDevice:
                     max_total_time = COMMAND_TIMEOUT / 1000 * (MAX_RESPONSE_RETRIES + 1)
                     if command.started_at > 0 and now - command.started_at > max_total_time:
                         _LOGGER.warning(
-                            "Command %s timed out after %.1fs (max %.1fs)",
+                            "%sCommand %s timed out after %.1fs (max %.1fs)", self._log_prefix,
                             command.execute_name,
                             now - command.started_at,
                             max_total_time,
@@ -2227,7 +2424,7 @@ class TeslaBleDevice:
                         if command.priority > 0:  # HIGH priority user command
                             if command.requeue_count < MAX_REQUEUE_ATTEMPTS:
                                 _LOGGER.warning(
-                                    "Re-queuing HIGH priority command %s after timeout (attempt %d/%d), forcing disconnect to reconnect via fresh proxy",
+                                    "%sRe-queuing HIGH priority command %s after timeout (attempt %d/%d), forcing disconnect to reconnect via fresh proxy", self._log_prefix,
                                     command.execute_name,
                                     command.requeue_count + 1,
                                     MAX_REQUEUE_ATTEMPTS,
@@ -2251,7 +2448,7 @@ class TeslaBleDevice:
                                 return
                             else:
                                 _LOGGER.error(
-                                    "HIGH priority command %s exceeded max requeue attempts (%d), giving up",
+                                    "%sHIGH priority command %s exceeded max requeue attempts (%d), giving up", self._log_prefix,
                                     command.execute_name,
                                     MAX_REQUEUE_ATTEMPTS,
                                 )
@@ -2272,7 +2469,7 @@ class TeslaBleDevice:
 
                             if in_wake_burst and command.requeue_count < MAX_REQUEUE_ATTEMPTS:
                                 _LOGGER.warning(
-                                    "Re-queuing LOW priority command %s after timeout during wake burst (attempt %d/%d, %.1fs since wake)",
+                                    "%sRe-queuing LOW priority command %s after timeout during wake burst (attempt %d/%d, %.1fs since wake)", self._log_prefix,
                                     command.execute_name,
                                     command.requeue_count + 1,
                                     MAX_REQUEUE_ATTEMPTS,
@@ -2295,7 +2492,7 @@ class TeslaBleDevice:
                             else:
                                 # Outside wake burst or max retries - discard and disconnect
                                 _LOGGER.warning(
-                                    "Discarding LOW priority command %s (domain=%s) after timeout, invalidating domain session and disconnecting",
+                                    "%sDiscarding LOW priority command %s (domain=%s) after timeout, invalidating domain session and disconnecting", self._log_prefix,
                                     command.execute_name,
                                     command.domain,
                                 )
@@ -2394,14 +2591,14 @@ class TeslaBleDevice:
                 if await self.wake_vehicle():
                     command.last_tx_at = now
                 else:
-                    _LOGGER.error("Failed to request vehicle wake for command %s", command.execute_name)
+                    _LOGGER.error("%sFailed to request vehicle wake for command %s", self._log_prefix, command.execute_name)
                     return True
                 return False
 
             if command.domain == UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY:
                 if not self.key_manager.is_session_valid(command.domain):
                     if command.retry_count >= MAX_SESSION_RETRIES:
-                        _LOGGER.error("Failed to authenticate VCSEC after retries")
+                        _LOGGER.error("%sFailed to authenticate VCSEC after retries", self._log_prefix)
                         return True
                     await self._send_session_info_request(command.domain)
                     # Transition to AUTH_RESPONSE state to wait for SessionInfo response
@@ -2418,7 +2615,7 @@ class TeslaBleDevice:
                 _LOGGER.debug("Infotainment session valid check: %s", session_valid)
                 if not session_valid:
                     if command.retry_count >= MAX_SESSION_RETRIES:
-                        _LOGGER.error("Failed to authenticate Infotainment after retries")
+                        _LOGGER.error("%sFailed to authenticate Infotainment after retries", self._log_prefix)
                         return True
                     await self._send_session_info_request(command.domain)
                     # Transition to AUTH_RESPONSE state to wait for SessionInfo response
@@ -2446,7 +2643,7 @@ class TeslaBleDevice:
                     elif command.domain == UniversalMessageDomain.DOMAIN_INFOTAINMENT:
                         command.state = BLECommandState.WAITING_FOR_INFOTAINMENT_AUTH
                     else:
-                        _LOGGER.error("Unknown domain %s for command %s after wake", command.domain, command.execute_name)
+                        _LOGGER.error("%sUnknown domain %s for command %s after wake", self._log_prefix, command.domain, command.execute_name)
                         return True  # Remove command
                     command.retry_count = 0
                     command.retry_delay = 0
@@ -2461,7 +2658,7 @@ class TeslaBleDevice:
             retry_delay = command.retry_delay or WAKE_RETRY_INTERVAL
             if now - command.last_tx_at > retry_delay:
                 if command.retry_count >= MAX_WAKE_RETRIES:
-                    _LOGGER.error("Failed to wake vehicle for command %s", command.execute_name)
+                    _LOGGER.error("%sFailed to wake vehicle for command %s", self._log_prefix, command.execute_name)
                     return True
                 _LOGGER.debug("Retrying vehicle wake for command %s (attempt %s/%s)", command.execute_name, command.retry_count + 1, MAX_WAKE_RETRIES)
                 if await self.wake_vehicle():
@@ -2469,7 +2666,7 @@ class TeslaBleDevice:
                     command.last_tx_at = now
                     command.retry_delay = min(retry_delay * 2, WAKE_RETRY_MAX_DELAY)
                 else:
-                    _LOGGER.error("Wake request failed while preparing command %s", command.execute_name)
+                    _LOGGER.error("%sWake request failed while preparing command %s", self._log_prefix, command.execute_name)
                     return True
             return False
 
@@ -2482,7 +2679,7 @@ class TeslaBleDevice:
                 retry_delay = command.retry_delay or SESSION_RETRY_INTERVAL
                 if now - command.last_tx_at >= retry_delay:
                     if command.retry_count >= MAX_SESSION_RETRIES:
-                        _LOGGER.error("Failed to authenticate VCSEC after retries")
+                        _LOGGER.error("%sFailed to authenticate VCSEC after retries", self._log_prefix)
                         return True
                     await self._send_session_info_request(command.domain)
                     # Transition to AUTH_RESPONSE state to wait for SessionInfo response
@@ -2498,7 +2695,7 @@ class TeslaBleDevice:
             if now - command.last_tx_at > MAX_LATENCY:
                 if command.retry_count >= MAX_SESSION_RETRIES:
                     _LOGGER.error(
-                        "Failed to get VCSEC SessionInfo response after %d retries - vehicle not responding, invalidating session and disconnecting",
+                        "%sFailed to get VCSEC SessionInfo response after %d retries - vehicle not responding, invalidating session and disconnecting", self._log_prefix,
                         MAX_SESSION_RETRIES,
                     )
                     self.key_manager.invalidate_session(command.domain)
@@ -2510,7 +2707,7 @@ class TeslaBleDevice:
                         await self._reinitialize_crypto()
                     except Exception as ex:
                         _LOGGER.error(
-                            "Crypto reinitialization failed after VCSEC auth timeout: %s",
+                            "%sCrypto reinitialization failed after VCSEC auth timeout: %s", self._log_prefix,
                             ex,
                             exc_info=True,
                         )
@@ -2519,7 +2716,7 @@ class TeslaBleDevice:
                         return False
                     return True  # Remove command, will be retried fresh on reconnect
                 _LOGGER.warning(
-                    "Timeout waiting for VCSEC SessionInfo response, retrying (attempt %d/%d)",
+                    "%sTimeout waiting for VCSEC SessionInfo response, retrying (attempt %d/%d)", self._log_prefix,
                     command.retry_count + 1,
                     MAX_SESSION_RETRIES,
                 )
@@ -2536,7 +2733,7 @@ class TeslaBleDevice:
                 retry_delay = command.retry_delay or SESSION_RETRY_INTERVAL
                 if now - command.last_tx_at >= retry_delay:
                     if command.retry_count >= MAX_SESSION_RETRIES:
-                        _LOGGER.error("Failed to authenticate Infotainment after retries")
+                        _LOGGER.error("%sFailed to authenticate Infotainment after retries", self._log_prefix)
                         return True
                     await self._send_session_info_request(command.domain)
                     # Transition to AUTH_RESPONSE state to wait for SessionInfo response
@@ -2552,7 +2749,7 @@ class TeslaBleDevice:
             if now - command.last_tx_at > MAX_LATENCY:
                 if command.retry_count >= MAX_SESSION_RETRIES:
                     _LOGGER.error(
-                        "Failed to get Infotainment SessionInfo response after %d retries - vehicle not responding, invalidating session and disconnecting",
+                        "%sFailed to get Infotainment SessionInfo response after %d retries - vehicle not responding, invalidating session and disconnecting", self._log_prefix,
                         MAX_SESSION_RETRIES,
                     )
                     self.key_manager.invalidate_session(command.domain)
@@ -2561,7 +2758,7 @@ class TeslaBleDevice:
                         await self._reinitialize_crypto()
                     except Exception as ex:
                         _LOGGER.error(
-                            "Crypto reinitialization failed after Infotainment auth timeout: %s",
+                            "%sCrypto reinitialization failed after Infotainment auth timeout: %s", self._log_prefix,
                             ex,
                             exc_info=True,
                         )
@@ -2570,7 +2767,7 @@ class TeslaBleDevice:
                         return False
                     return True  # Remove command, will be retried fresh on reconnect
                 _LOGGER.warning(
-                    "Timeout waiting for Infotainment SessionInfo response, retrying (attempt %d/%d)",
+                    "%sTimeout waiting for Infotainment SessionInfo response, retrying (attempt %d/%d)", self._log_prefix,
                     command.retry_count + 1,
                     MAX_SESSION_RETRIES,
                 )
@@ -2601,7 +2798,7 @@ class TeslaBleDevice:
                 self._schedule_command_timeout(command.domain, command)
                 return False
             except Exception as ex:
-                _LOGGER.error("Failed to execute command %s: %s, removing from queue", command.execute_name, ex)
+                _LOGGER.error("%sFailed to execute command %s: %s, removing from queue", self._log_prefix, command.execute_name, ex)
                 return True  # Remove failed command from queue
 
         if command.state == BLECommandState.WAITING_FOR_GET_POST_SET:
@@ -2632,7 +2829,7 @@ class TeslaBleDevice:
 
                 if (is_get_command or is_user_command) and command.retry_count < MAX_RESPONSE_RETRIES:
                     _LOGGER.warning(
-                        "Command %s timed out waiting for response, retrying immediately (attempt %d/%d)",
+                        "%sCommand %s timed out waiting for response, retrying immediately (attempt %d/%d)", self._log_prefix,
                         command.execute_name,
                         command.retry_count + 1,
                         MAX_RESPONSE_RETRIES,
@@ -2643,7 +2840,7 @@ class TeslaBleDevice:
                     return False
                 else:
                     _LOGGER.warning(
-                        "Command %s timed out waiting for response after %d retries, removing from queue",
+                        "%sCommand %s timed out waiting for response after %d retries, removing from queue", self._log_prefix,
                         command.execute_name,
                         command.retry_count,
                     )
@@ -2798,7 +2995,7 @@ class TeslaBleDevice:
             _LOGGER.debug("Triggering data update callback for domain %s", domain)
             self._data_update_callback()
         else:
-            _LOGGER.warning("No data update callback registered")
+            _LOGGER.warning("%sNo data update callback registered", self._log_prefix)
 
         self._spawn_task(self._process_domain_queue(domain), f"complete_kick.{domain.name}")
 
@@ -2832,7 +3029,7 @@ class TeslaBleDevice:
             if command.domain == UniversalMessageDomain.DOMAIN_INFOTAINMENT:
                 action_spec = ACTION_SPECIFICS.get(command.action)
                 if not action_spec:
-                    _LOGGER.error("Unknown action: %s", command.action)
+                    _LOGGER.error("%sUnknown action: %s", self._log_prefix, command.action)
                     return
 
                 if action_spec.which_msg == AllowedMsg.VehicleActionMessage:
@@ -2853,7 +3050,7 @@ class TeslaBleDevice:
                         command.action
                     )
                 else:
-                    _LOGGER.error("Unhandled message type for action %s", command.action)
+                    _LOGGER.error("%sUnhandled message type for action %s", self._log_prefix, command.action)
                     return
 
             elif command.domain == UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY:
@@ -2902,10 +3099,10 @@ class TeslaBleDevice:
                             setattr(closure_request, mapping[closure_type], move_enum)
                             message_bytes = self.protocol_client.build_vcsec_closure_move_request(closure_request)
                         else:
-                            _LOGGER.error("Unknown closure type: %s", closure_type)
+                            _LOGGER.error("%sUnknown closure type: %s", self._log_prefix, closure_type)
                             return
                     else:
-                        _LOGGER.error("Invalid closure_move command format: %s", command.execute_name)
+                        _LOGGER.error("%sInvalid closure_move command format: %s", self._log_prefix, command.execute_name)
                         return
                 else:
                     _LOGGER.debug("Unhandled VCSEC command %s", command.execute_name)
@@ -2922,7 +3119,7 @@ class TeslaBleDevice:
             await self._write_ble_data(message_bytes)
 
         except Exception as ex:
-            _LOGGER.error("Failed to execute command %s: %s", command.execute_name, ex)
+            _LOGGER.error("%sFailed to execute command %s: %s", self._log_prefix, command.execute_name, ex)
             raise
 
     def set_ble_available(self, available: bool) -> None:
@@ -3016,13 +3213,13 @@ class TeslaBleDevice:
                     reason = self._pairing_failure_reason or self._pairing_reason_from_info(self._pairing_wait_info)
                     if reason:
                         _LOGGER.error(
-                            "BLE key pairing timed out after %s seconds: %s",
+                            "%sBLE key pairing timed out after %s seconds: %s", self._log_prefix,
                             timeout,
                             reason,
                         )
                         self._pairing_failure_reason = reason
                     else:
-                        _LOGGER.error("BLE key pairing timed out after %s seconds", timeout)
+                        _LOGGER.error("%sBLE key pairing timed out after %s seconds", self._log_prefix, timeout)
                     return False
             else:
                 # Async mode - return immediately after sending request
@@ -3030,7 +3227,7 @@ class TeslaBleDevice:
                 return True
 
         except Exception as ex:
-            _LOGGER.error("Failed to pair BLE key: %s", ex)
+            _LOGGER.error("%sFailed to pair BLE key: %s", self._log_prefix, ex)
             return False
 
     async def pair(self, wait_for_completion: bool = True) -> bool:
@@ -3044,7 +3241,7 @@ class TeslaBleDevice:
                     self.hass, self.address.upper(), connectable=True
                 )
                 if self.ble_device is None:
-                    _LOGGER.error("Could not find BLE device at address %s", self.address)
+                    _LOGGER.error("%sCould not find BLE device at address %s", self._log_prefix, self.address)
                     return False
 
             # Initialize crypto manager
@@ -3062,7 +3259,7 @@ class TeslaBleDevice:
             return await self.pair_key(wait_for_completion=wait_for_completion)
 
         except Exception as ex:
-            _LOGGER.error("Failed to pair with Tesla: %s", ex)
+            _LOGGER.error("%sFailed to pair with Tesla: %s", self._log_prefix, ex)
             if self._pairing_failure_reason is None:
                 self._pairing_failure_reason = "pairing_failed"
             return False
@@ -3121,7 +3318,7 @@ class TeslaBleDevice:
             await self._process_domain_queue(UniversalMessageDomain.DOMAIN_VEHICLE_SECURITY)
             return True
         except Exception as ex:
-            _LOGGER.error("Failed to queue wake command: %s", ex)
+            _LOGGER.error("%sFailed to queue wake command: %s", self._log_prefix, ex)
             return False
 
     async def lock_unlock_vehicle(self, lock: bool) -> bool:
@@ -3161,5 +3358,5 @@ class TeslaBleDevice:
             return True
 
         except Exception as ex:
-            _LOGGER.error("Failed to lock/unlock vehicle: %s", ex)
+            _LOGGER.error("%sFailed to lock/unlock vehicle: %s", self._log_prefix, ex)
             return False

@@ -23,3 +23,25 @@ jobs:
         with:
           category: integration
           ignore: brands
+
+  # Unit tests. Previously nothing ran pytest, so the suite silently rotted
+  # against the code it was meant to guard (stale attribute names, a test that
+  # hung forever on a real BLE connector). Keep this job green.
+  #
+  # The checkout directory must be named `tesla_ble`: this is a content_in_root
+  # repository, so the repo root IS the package, and the tests import it as such.
+  tests:
+    name: Unit tests
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: tesla_ble
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+      - name: Install dependencies
+        run: pip install pytest pytest-asyncio pytest-timeout protobuf cryptography bleak-retry-connector
+      - name: Run tests
+        working-directory: tesla_ble
+        run: python -m pytest -q --timeout=60

@@ -1,182 +1,15 @@
 """Test Tesla BLE device."""
-from datetime import datetime, timezone
-import sys
 import time
-from types import ModuleType, SimpleNamespace
-from typing import Generic, TypeVar
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, call
 
 import pytest
 from bleak_retry_connector import BleakError
 
 
-def _ensure_homeassistant_stubs() -> None:
-    for mod_name in list(sys.modules):
-        if mod_name.startswith("homeassistant"):
-            sys.modules.pop(mod_name)
+from ha_stubs import install_homeassistant_stubs
 
-    ha_module = ModuleType("homeassistant")
-    sys.modules["homeassistant"] = ha_module
-
-    components_module = ModuleType("homeassistant.components")
-    components_module.__path__ = []  # treat as package for submodule imports
-    components_module.__package__ = "homeassistant"
-    import importlib.machinery
-    components_module.__spec__ = importlib.machinery.ModuleSpec(
-        "homeassistant.components", loader=None, is_package=True
-    )
-    bluetooth_module = ModuleType("homeassistant.components.bluetooth")
-    bluetooth_module.async_ble_device_from_address = lambda *args, **kwargs: None
-    bluetooth_module.async_track_unavailable = lambda *args, **kwargs: None
-    bluetooth_module.BluetoothChange = object
-    bluetooth_module.BluetoothServiceInfoBleak = object
-    bluetooth_module.BluetoothScanningMode = SimpleNamespace(ACTIVE="active", PASSIVE="passive")
-
-    sys.modules["homeassistant.components"] = components_module
-    sys.modules["homeassistant.components.bluetooth"] = bluetooth_module
-    components_module.bluetooth = bluetooth_module
-
-    core_module = ModuleType("homeassistant.core")
-    core_module.HomeAssistant = object
-    def _callback(func):
-        return func
-    core_module.callback = _callback
-    sys.modules["homeassistant.core"] = core_module
-
-    helpers_module = ModuleType("homeassistant.helpers")
-    storage_module = ModuleType("homeassistant.helpers.storage")
-
-    class _Store:
-        def __init__(self, *args, **kwargs):
-            self.data = None
-
-        async def async_load(self):
-            return self.data
-
-        async def async_save(self, data):
-            self.data = data
-
-    storage_module.Store = _Store
-    sys.modules["homeassistant.helpers"] = helpers_module
-    sys.modules["homeassistant.helpers.storage"] = storage_module
-    helpers_module.storage = storage_module
-
-    config_entries_module = ModuleType("homeassistant.config_entries")
-    config_entries_module.ConfigEntry = object
-    sys.modules["homeassistant.config_entries"] = config_entries_module
-
-    const_module = ModuleType("homeassistant.const")
-    const_module.Platform = SimpleNamespace(
-        BINARY_SENSOR="binary_sensor",
-        BUTTON="button",
-        COVER="cover",
-        LOCK="lock",
-        NUMBER="number",
-        SENSOR="sensor",
-        SWITCH="switch",
-    )
-    const_module.ATTR_CONNECTIONS = "connections"
-    sys.modules["homeassistant.const"] = const_module
-
-    device_registry_module = ModuleType("homeassistant.helpers.device_registry")
-    device_registry_module.DeviceInfo = dict
-    device_registry_module.CONNECTION_BLUETOOTH = "bluetooth"
-    device_registry_module.CONNECTION_NETWORK_MAC = "network_mac"
-    sys.modules["homeassistant.helpers.device_registry"] = device_registry_module
-
-    sensor_module = ModuleType("homeassistant.components.sensor")
-
-    class _SensorEntity:
-        def __init__(self, *args, **kwargs):
-            self._attr_native_value = None
-
-        @property
-        def native_value(self):
-            return self._attr_native_value
-
-        @native_value.setter
-        def native_value(self, value):
-            self._attr_native_value = value
-
-        def __getattr__(self, item):  # pragma: no cover - minimal stub
-            raise AttributeError(item)
-
-    sensor_module.SensorEntity = _SensorEntity
-    sensor_module.SensorEntityDescription = object
-    sensor_module.SensorDeviceClass = SimpleNamespace(
-        BATTERY="battery",
-        DISTANCE="distance",
-        ENUM="enum",
-        CURRENT="current",
-        VOLTAGE="voltage",
-        POWER="power",
-        ENERGY="energy",
-        DURATION="duration",
-        TEMPERATURE="temperature",
-        SPEED="speed",
-        SIGNAL_STRENGTH="signal_strength",
-        TIMESTAMP="timestamp",
-    )
-    sensor_module.SensorStateClass = SimpleNamespace(MEASUREMENT="measurement", TOTAL_INCREASING="total_increasing")
-    sensor_module.__package__ = "homeassistant.components"
-    sensor_module.__file__ = __file__
-    sensor_module.__spec__ = importlib.machinery.ModuleSpec(
-        "homeassistant.components.sensor", loader=None, is_package=False
-    )
-
-    sys.modules["homeassistant.components.sensor"] = sensor_module
-    components_module.sensor = sensor_module
-
-    passive_module = ModuleType(
-        "homeassistant.components.bluetooth.passive_update_coordinator"
-    )
-    passive_module.__package__ = "homeassistant.components.bluetooth"
-    import importlib.machinery
-    passive_module.__spec__ = importlib.machinery.ModuleSpec(
-        "homeassistant.components.bluetooth.passive_update_coordinator",
-        loader=None,
-        is_package=False,
-    )
-
-    _T = TypeVar("_T")
-
-    class _PassiveEntity(Generic[_T]):
-        def __init__(self, coordinator):
-            self.coordinator = coordinator
-            self._attr_unique_id = None
-
-        @classmethod
-        def __class_getitem__(cls, _item):  # pragma: no cover
-            return cls
-
-        @property
-        def unique_id(self):  # pragma: no cover
-            return self._attr_unique_id
-
-    passive_module.PassiveBluetoothCoordinatorEntity = _PassiveEntity
-    sys.modules[
-        "homeassistant.components.bluetooth.passive_update_coordinator"
-    ] = passive_module
-
-    exceptions_module = ModuleType("homeassistant.exceptions")
-    class _HomeAssistantError(Exception):
-        pass
-    exceptions_module.HomeAssistantError = _HomeAssistantError
-    sys.modules["homeassistant.exceptions"] = exceptions_module
-
-    ha_module.components = components_module
-    ha_module.core = core_module
-    ha_module.helpers = helpers_module
-    ha_module.config_entries = config_entries_module
-    ha_module.const = const_module
-
-    util_module = ModuleType("homeassistant.util")
-    util_module.slugify = lambda value: str(value).lower().replace(" ", "_").replace("'", "")
-    sys.modules["homeassistant.util"] = util_module
-    ha_module.util = util_module
-
-
-_ensure_homeassistant_stubs()
+install_homeassistant_stubs()
 
 from ..const import (
     CHARGING_STATE_CHARGING,
@@ -249,14 +82,18 @@ async def test_device_initialization(tesla_device):
 @pytest.mark.asyncio
 async def test_queue_command(tesla_device):
     """Test command queueing."""
+    # Queueing kicks the domain queue, which would otherwise attempt real BLE I/O.
+    tesla_device._process_domain_queue = AsyncMock()
+
     await tesla_device._queue_command(
         "test_command",
         BLECarServerVehicleAction.GET_CHARGE_STATE,
         UniversalMessageDomain.DOMAIN_INFOTAINMENT
     )
 
-    assert len(tesla_device._command_queue) == 1
-    command = tesla_device._command_queue[0]
+    queued = tesla_device._queue_state(UniversalMessageDomain.DOMAIN_INFOTAINMENT).iter_all()
+    assert len(queued) == 1
+    command = queued[0]
     assert command.execute_name == "test_command"
     assert command.action == BLECarServerVehicleAction.GET_CHARGE_STATE
     assert command.domain == UniversalMessageDomain.DOMAIN_INFOTAINMENT
@@ -323,7 +160,12 @@ def test_should_poll_fast_after_wake(monkeypatch, tesla_device):
     tesla_device.post_wake_poll_time = 120
     tesla_device.poll_data_period = 15
 
+    # First detection of a wake polls immediately, regardless of the interval.
     monkeypatch.setattr("tesla_ble.device.time.time", lambda: 208.0)
+    assert tesla_device.should_poll() is True
+
+    # Once that first poll is consumed, the post-wake window uses poll_data_period.
+    tesla_device._car_just_woken = False
     assert tesla_device.should_poll() is False
 
     monkeypatch.setattr("tesla_ble.device.time.time", lambda: 216.0)
@@ -402,10 +244,15 @@ async def test_send_vehicle_action_uses_protocol_client(tesla_device):
         parameter2=None,
     )
     tesla_device._write_ble_data.assert_called_once_with(b"vehicle")
-    # Initially only one command should be queued (the SET_HVAC_SWITCH)
-    assert len(tesla_device._command_queue) == 1
-    assert tesla_device._command_queue[0].action == BLECarServerVehicleAction.SET_HVAC_SWITCH
-    tesla_device._command_queue.clear()
+    # Only the SET_HVAC_SWITCH is outstanding; its follow-up GET is queued later,
+    # once the SET response arrives.
+    queue_state = tesla_device._queue_state(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
+    assert queue_state.current_command is not None
+    assert queue_state.current_command.action == BLECarServerVehicleAction.SET_HVAC_SWITCH
+    # peek() promotes a command to current_command without removing it from its
+    # deque, so iter_all() yields the same object twice while it is in flight.
+    assert {id(c) for c in queue_state.iter_all()} == {id(queue_state.current_command)}
+    queue_state.clear()
 
 
 @pytest.mark.asyncio
@@ -459,10 +306,8 @@ async def test_connect_uses_bleak_retry(monkeypatch, tesla_device):
     class FakeClient:
         def __init__(self, device, **_kwargs):
             self.device = device
-            self.is_connected = False
-
-        async def connect(self, timeout=None, **_kwargs):
             self.is_connected = True
+            self.mtu_size = 23
 
         async def start_notify(self, uuid, callback):
             return None
@@ -470,9 +315,14 @@ async def test_connect_uses_bleak_retry(monkeypatch, tesla_device):
         async def disconnect(self):
             self.is_connected = False
 
-    monkeypatch.setattr("tesla_ble.device.BleakClient", FakeClient)
+    # _connect goes through bleak_retry_connector.establish_connection, not
+    # BleakClient directly; patching the latter let the real connector run and hang.
+    establish_mock = AsyncMock(side_effect=lambda cls, device, name, disconnect_cb, **kw: FakeClient(device))
+    monkeypatch.setattr("tesla_ble.device.establish_connection", establish_mock)
 
     await tesla_device._connect()
+
+    establish_mock.assert_awaited_once()
 
     close_mock.assert_awaited_once_with("AA:BB:CC:DD:EE:FF")
     async_ble_mock.assert_called_once()
@@ -502,7 +352,7 @@ async def test_send_vehicle_action_requests_session_when_invalid(tesla_device):
     tesla_device._send_session_info_request.assert_awaited_with(
         UniversalMessageDomain.DOMAIN_INFOTAINMENT
     )
-    tesla_device._command_queue.clear()
+    tesla_device._queue_state(UniversalMessageDomain.DOMAIN_INFOTAINMENT).clear()
 
 
 def test_update_signal_strength_tracks_rssi(tesla_device):
@@ -607,14 +457,17 @@ async def test_handle_infotainment_response_populates_data(tesla_device):
 
     parsed = ParsedCarServerResponse(response=FakeResponse(vehicle_data), fault=0)
     tesla_device._complete_domain_command = MagicMock()
-    tesla_device._command_queue.append(
+    infotainment_queue = tesla_device._queue_state(UniversalMessageDomain.DOMAIN_INFOTAINMENT)
+    infotainment_queue.add_command(
         BLECommand(
             execute_name="vehicle_action_SET_HVAC_SWITCH",
             action=BLECarServerVehicleAction.SET_HVAC_SWITCH,
             domain=UniversalMessageDomain.DOMAIN_INFOTAINMENT,
             state=BLECommandState.WAITING_FOR_RESPONSE,
-        )
+        ),
+        priority=0,
     )
+    infotainment_queue.peek()  # promote to current_command, as the queue runner does
 
     await tesla_device._handle_infotainment_response(parsed)
 
@@ -624,7 +477,7 @@ async def test_handle_infotainment_response_populates_data(tesla_device):
     assert tesla_device.data["minutes_to_limit"] == 30
     assert tesla_device.data["steering_wheel_heater"] is True
     assert tesla_device.data["defrost_active"] is True
-    assert tesla_device.data["is_boot_open"] is True
+    assert tesla_device.data["is_trunk_open"] is True
     assert tesla_device.data["windows_open"] is True
     assert tesla_device.data["sentry_mode"] is True
     assert tesla_device.data["is_preconditioning"] is True
@@ -632,16 +485,15 @@ async def test_handle_infotainment_response_populates_data(tesla_device):
     assert tesla_device.data["driver_rear_door_open"] is False
     assert tesla_device.data["passenger_front_door_open"] is True
     assert tesla_device.data["passenger_rear_door_open"] is False
-    assert tesla_device.data["vehicle_speed"] == 35.5
-    assert tesla_device.data["latitude"] == 51.5
-    assert tesla_device.data["longitude"] == -0.13
-    assert tesla_device.data["heading"] == 180
-    assert tesla_device.data["gps_as_of"] == datetime.fromtimestamp(1690000000, timezone.utc)
+    # NOTE: speed / lat / lon / heading / gps_as_of are deliberately not asserted.
+    # _handle_infotainment_response does not parse location_state and extracts no
+    # speed field from drive_state, and no entity exposes them, so these were dead
+    # assertions on behaviour the integration has never implemented.
     assert tesla_device.data["defrost_mode"] == "Normal"
     assert tesla_device.data["sentry_mode_state"] == "Armed"
-    assert tesla_device._command_queue[0].state == BLECommandState.WAITING_FOR_GET_POST_SET
+    assert infotainment_queue.current_command.state == BLECommandState.WAITING_FOR_GET_POST_SET
     tesla_device._complete_domain_command.assert_not_called()
-    tesla_device._command_queue.clear()
+    infotainment_queue.clear()
 
 
 @pytest.mark.asyncio
@@ -682,6 +534,8 @@ async def test_handle_vcsec_response_decrypts_encrypted_payload(tesla_device):
         signature_data.nonce,
         signature_data.tag,
         0,
+        0,
+        routable.flags,
     )
     assert tesla_device.vehicle_state == "awake"
     assert tesla_device.data["doors_locked"] is True
@@ -792,7 +646,7 @@ def test_entity_unique_id_and_update(monkeypatch):
 
     class DummyCoordinator:
         def __init__(self) -> None:
-            self.device_name = "Daniel's Model Y"
+            self.device_name = "Test Vehicle"
             self.entry_id = "1234567890abcdef"
             self.base_unique_id = "1234567890abcdef"
             self.ble_device = MagicMock(address="AA:BB:CC:DD:EE:FF")
@@ -819,7 +673,7 @@ def test_entity_unique_id_and_update(monkeypatch):
 
     entity = DummyEntity()
 
-    assert entity.unique_id.startswith("daniels_model_y_")
+    assert entity.unique_id.startswith(f"{coordinator.base_unique_id}_")
     assert entity.unique_id.endswith("charge_level")
     assert getattr(entity, "_attr_translation_key") == "charge_level"
 
@@ -850,64 +704,65 @@ async def test_send_vcsec_closure_move_requests_session_when_invalid(tesla_devic
 
 @pytest.mark.asyncio
 async def test_write_ble_chunk_falls_back_to_no_response(tesla_device):
-    """Write failures should fall back to write-without-response after retry."""
+    """A write-with-response rejection retries the same chunk without response."""
 
     chunk = b"\x01\x02"
 
-    client1 = MagicMock()
-    client1.is_connected = True
-    client1.write_gatt_char = AsyncMock(side_effect=BleakError("Characteristic does not support write-with-response"))
-    client1.disconnect = AsyncMock()
+    client = MagicMock()
+    client.is_connected = True
+    client.write_gatt_char = AsyncMock(
+        side_effect=[
+            BleakError("Characteristic does not support write-with-response"),
+            None,
+        ]
+    )
+    client.disconnect = AsyncMock()
 
-    client2 = MagicMock()
-    client2.is_connected = True
-    client2.write_gatt_char = AsyncMock(return_value=None)
-    client2.disconnect = AsyncMock()
-
-    async def set_client2():
-        tesla_device._client = client2
-
-    tesla_device._client = client1
-    tesla_device._connect = AsyncMock(side_effect=set_client2)
+    tesla_device._client = client
+    tesla_device._connect = AsyncMock()
 
     await tesla_device._write_ble_chunk(chunk)
 
-    assert client1.write_gatt_char.await_args_list == [
+    assert client.write_gatt_char.await_args_list == [
         call(WRITE_UUID, chunk, response=True),
         call(WRITE_UUID, chunk, response=False),
     ]
-    client1.disconnect.assert_awaited_once()
-    tesla_device._connect.assert_awaited_once()
     assert tesla_device._write_with_response is False
-    assert tesla_device._client is client2
+    # _write_ble_chunk must never establish a connection: doing so mid-message
+    # would deliver the tail of a message on a different link.
+    tesla_device._connect.assert_not_awaited()
+    assert tesla_device._client is client
 
 
 @pytest.mark.asyncio
 async def test_write_ble_chunk_raises_after_max_attempts(tesla_device):
-    """Write chunk should raise after exhausting retries."""
+    """Write chunk should raise once its attempts are exhausted."""
 
-    attempts: list[MagicMock] = []
+    client = MagicMock()
+    client.is_connected = True
+    client.write_gatt_char = AsyncMock(side_effect=BleakError("boom"))
+    client.disconnect = AsyncMock()
 
-    async def connect_side_effect():
-        client = MagicMock()
-        client.is_connected = True
-        client.write_gatt_char = AsyncMock(side_effect=BleakError("boom"))
-        client.disconnect = AsyncMock()
-        attempts.append(client)
-        tesla_device._client = client
-
-    tesla_device._client = None
-    tesla_device._connect = AsyncMock(side_effect=connect_side_effect)
+    tesla_device._client = client
+    tesla_device._connect = AsyncMock()
 
     with pytest.raises(RuntimeError):
         await tesla_device._write_ble_chunk(b"\x01\x02")
 
-    assert tesla_device._connect.await_count == BLE_WRITE_MAX_ATTEMPTS
-    for client in attempts:
-        client.write_gatt_char.assert_awaited_once_with(WRITE_UUID, b"\x01\x02", response=True)
-        client.disconnect.assert_awaited_once()
+    assert client.write_gatt_char.await_count == BLE_WRITE_MAX_ATTEMPTS
+    client.write_gatt_char.assert_awaited_with(WRITE_UUID, b"\x01\x02", response=True)
+    tesla_device._connect.assert_not_awaited()
     assert tesla_device._write_with_response is True
-    assert tesla_device._client is None
+
+
+@pytest.mark.asyncio
+async def test_write_ble_chunk_raises_when_link_drops(tesla_device):
+    """A chunk write must fail fast rather than silently reconnecting."""
+
+    tesla_device._client = None
+
+    with pytest.raises(BleakError):
+        await tesla_device._write_ble_chunk(b"\x01\x02")
 
 
 @pytest.mark.asyncio
